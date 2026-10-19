@@ -12,18 +12,30 @@
 #   updated=<unix time>
 # The file is written to a temporary name and renamed, so the app's directory
 # watcher sees one complete change.
+#
+# The script runs on every tool call, so it stays cheap: one jq call for the
+# payload, the claude pid is looked up once per session, and it always exits 0
+# with nothing on stdout, so it can neither block nor confuse Claude Code.
 
 state="$1"
 dir="$HOME/.claude/traffic-light/sessions"
-mkdir -p "$dir"
+[ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || exit 0
 
-input=$(cat)
-session_id=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
-cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
-title=$(printf '%s' "$input" | jq -r '.session_title // empty | gsub("[\\n\\r\\t]+"; " ")' 2>/dev/null)
-# UserPromptSubmit carries the message you sent. Kept to one line and 400 characters,
-# sliced by jq so a multibyte character is never cut in half.
-prompt=$(printf '%s' "$input" | jq -r '.prompt // empty | gsub("[\\n\\r\\t]+"; " ") | gsub(" +"; " ") | .[0:400]' 2>/dev/null)
+# One jq call gives the four fields, one per line. Title and prompt are folded to
+# one line and the prompt is cut to 400 characters, sliced by jq so a multibyte
+# character is never cut in half.
+fields=$(jq -r '
+  def line: tostring | gsub("[\\n\\r\\t]+"; " ") | gsub(" +"; " ");
+  (.session_id // ""), (.cwd // ""),
+  ((.session_title // "") | line),
+  ((.prompt // "") | line | .[0:400])' 2>/dev/null) || exit 0
+{
+  IFS= read -r session_id
+  IFS= read -r cwd
+  IFS= read -r title
+  IFS= read -r prompt
+} <<< "$fields"
+
 [ -z "$session_id" ] && exit 0
 case "$session_id" in *[!A-Za-z0-9_-]*) exit 0;; esac
 
@@ -34,28 +46,35 @@ if [ "$state" = "gone" ]; then
   exit 0
 fi
 
-# Only some events carry the title and the prompt, the other events keep what was
-# recorded before.
+# Only some events carry the title and the prompt, and the pid does not change,
+# so the other events keep what was recorded before.
+claude_pid=""
 if [ -f "$file" ]; then
-  [ -z "$title" ] && title=$(sed -n 's/^title=//p' "$file")
-  [ -z "$prompt" ] && prompt=$(sed -n 's/^prompt=//p' "$file")
+  while IFS= read -r line; do
+    case "$line" in
+      pid=*) claude_pid=${line#pid=};;
+      title=*) [ -z "$title" ] && title=${line#title=};;
+      prompt=*) [ -z "$prompt" ] && prompt=${line#prompt=};;
+    esac
+  done < "$file"
 fi
 
 # Walk up the process tree to the claude process that runs this hook.
-pid=$PPID
-claude_pid=""
-for _ in 1 2 3 4 5 6; do
-  [ -z "$pid" ] || [ "$pid" = "0" ] || [ "$pid" = "1" ] && break
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
-  exe=${args%% *}
-  # The claude binary itself, or a node process that runs claude's script.
-  # A shell whose command line merely mentions a path under ~/.claude must not match.
-  case "${exe##*/}" in
-    claude*) claude_pid=$pid; break;;
-    node*) case "$args" in *claude*) claude_pid=$pid; break;; esac;;
-  esac
-  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-done
+if [ -z "$claude_pid" ]; then
+  pid=$PPID
+  for _ in 1 2 3 4 5 6; do
+    [ -z "$pid" ] || [ "$pid" = "0" ] || [ "$pid" = "1" ] && break
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    exe=${args%% *}
+    # The claude binary itself, or a node process that runs claude's script.
+    # A shell whose command line merely mentions a path under ~/.claude must not match.
+    case "${exe##*/}" in
+      claude*) claude_pid=$pid; break;;
+      node*) case "$args" in *claude*) claude_pid=$pid; break;; esac;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+fi
 
 tmp="$file.tmp.$$"
 {
@@ -65,5 +84,6 @@ tmp="$file.tmp.$$"
   echo "title=$title"
   echo "prompt=$prompt"
   echo "updated=$(date +%s)"
-} > "$tmp" && mv -f "$tmp" "$file"
+} > "$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null
+rm -f "$tmp" 2>/dev/null
 exit 0

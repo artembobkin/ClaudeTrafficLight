@@ -40,6 +40,7 @@ else
                              entry("permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input"; "attention"),
                              entry("idle_prompt"; "idle")]),
       Stop:               ((.hooks.Stop // [])               + [entry("idle")]),
+      StopFailure:        ((.hooks.StopFailure // [])        + [entry("idle")]),
       SessionEnd:         ((.hooks.SessionEnd // [])         + [entry("gone")])
     })' "$settings" > "$settings.new"
   mv "$settings.new" "$settings"

@@ -18,6 +18,7 @@
 // remembered. A right click opens the menu with Quit.
 
 import AppKit
+import Darwin
 
 enum SessionState: String {
     case working
@@ -66,10 +67,23 @@ final class SessionStore {
     /// deletes their files so the directory does not grow. Oldest session first, so
     /// a row keeps its place while newer sessions are added below it.
     func liveSessions() -> [Session] {
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+            // The folder was removed under the app, for example by uninstall.sh. Bring it
+            // back so the hooks and the watcher have something to write to and watch.
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return []
+        }
         var sessions: [Session] = []
-        for name in names where !name.contains(".tmp.") {
+        for name in names {
             let url = directory.appendingPathComponent(name)
+            if name.contains(".tmp.") {
+                // A hook killed in the middle of its write leaves its temporary file behind.
+                let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if Date().timeIntervalSince(modified) > 60 {
+                    try? FileManager.default.removeItem(at: url)
+                }
+                continue
+            }
             guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
             var fields: [String: String] = [:]
             for line in text.split(separator: "\n") {
@@ -79,7 +93,10 @@ final class SessionStore {
             guard let state = fields["state"].flatMap(SessionState.init(rawValue:)) else { continue }
             let pid = fields["pid"].flatMap { Int32($0) } ?? 0
             let updated = fields["updated"].flatMap { Double($0) }.map(Date.init(timeIntervalSince1970:)) ?? Date()
-            if pid > 0 && !Self.isAlive(pid) {
+            // The session is over when its claude process is gone. After a reboot the
+            // system may hand the same pid to another program, so the process behind the
+            // pid must still be claude for the session to count.
+            if pid > 0 && !Self.isClaudeProcess(pid) {
                 try? FileManager.default.removeItem(at: url)
                 continue
             }
@@ -97,9 +114,18 @@ final class SessionStore {
         return sessions.sorted { $0.updated < $1.updated }
     }
 
-    private static func isAlive(_ pid: Int32) -> Bool {
-        if kill(pid, 0) == 0 { return true }
-        return errno == EPERM
+    /// True when the pid belongs to a running claude binary, or to a node process
+    /// (claude installed through npm runs as node). The path is the resolved one:
+    /// ~/.local/bin/claude is a link to ~/.local/share/claude/versions/<version>, so
+    /// "claude" is looked for anywhere in the path, not only in the file name.
+    static func isClaudeProcess(_ pid: Int32) -> Bool {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return false }
+        let bytes = buffer[0..<Int(length)].map { UInt8(bitPattern: $0) }
+        let path = String(decoding: bytes, as: UTF8.self)
+        let name = (path as NSString).lastPathComponent
+        return path.lowercased().contains("claude") || name.hasPrefix("node")
     }
 }
 
@@ -300,6 +326,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func watchDirectory() {
+        directorySource?.cancel()
+        directorySource = nil
         let descriptor = open(store.directory.path, O_EVTONLY)
         guard descriptor >= 0 else { return }
         let source = DispatchSource.makeFileSystemObjectSource(
@@ -308,7 +336,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             queue: .main
         )
         source.setEventHandler { [weak self] in
-            Task { @MainActor in self?.refresh() }
+            guard let self else { return }
+            let gone = source.data.contains(.delete) || source.data.contains(.rename)
+            Task { @MainActor in
+                self.refresh()
+                if gone { self.watchDirectory() }
+            }
         }
         source.setCancelHandler {
             close(descriptor)
@@ -318,7 +351,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func refresh() {
+        let exists = FileManager.default.fileExists(atPath: store.directory.path)
         sessions = store.liveSessions()
+        if !exists || directorySource == nil {
+            // liveSessions recreated a missing folder, the watcher must follow it.
+            watchDirectory()
+        }
         listView.sessions = sessions
         listView.toolTip = sessions.isEmpty ? nil : sessions.map { session in
             let name = session.title.isEmpty ? session.folder : session.title

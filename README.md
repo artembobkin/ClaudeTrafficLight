@@ -18,10 +18,12 @@ Only Claude Code [hooks](https://code.claude.com/docs/en/hooks) are used. `hook.
 |---|---|
 | working | `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `PermissionDenied` |
 | needs you | `PermissionRequest`, `PreToolUse` on `AskUserQuestion`, `Notification` (`permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog`, `agent_needs_input`) |
-| done | `Stop`, `SessionStart`, `Notification` (`idle_prompt`) |
+| done | `Stop`, `StopFailure`, `SessionStart`, `Notification` (`idle_prompt`) |
 | removed | `SessionEnd` |
 
-Known gap: after you grant a permission in the dialog, no hook fires until that tool finishes, so the lamp stays yellow until then.
+Known gaps, both from how the hooks are defined: after you grant a permission in the dialog, no hook fires until that tool finishes, so the lamp stays yellow until then. `Stop` does not fire when you interrupt Claude with Esc, so the lamp stays red until the `idle_prompt` notification about a minute later.
+
+The hook also records the pid of the `claude` process, found by walking up the process tree, and the app drops a session whose process is gone or is no longer claude. That is the one thing not taken from the hook payload, and it only removes rows: a session that crashed or whose terminal was closed sends no `SessionEnd`.
 
 ## Install
 
