@@ -2,9 +2,11 @@
 # Installs Claude Traffic Light:
 #   1. the hook script into ~/.claude/traffic-light/hook.sh
 #   2. the hooks into ~/.claude/settings.json (a backup is kept next to the script)
-#   3. the app into ~/Applications, built from Sources/
-#   4. a LaunchAgent that starts the app at login and keeps it running
-# Running it again updates the script and the app and leaves the hooks as they are.
+#   3. the status line wrapper, which records the usage limits and then runs the
+#      status line command you had, kept in ~/.claude/traffic-light/statusline-command
+#   4. the app into ~/Applications, built from Sources/
+#   5. a LaunchAgent that starts the app at login and keeps it running
+# Running it again updates the scripts and the app and leaves the settings as they are.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 target="$HOME/.claude/traffic-light"
@@ -15,15 +17,22 @@ agent="$HOME/Library/LaunchAgents/$label.plist"
 command -v jq >/dev/null || { echo "jq is required (brew install jq)"; exit 1; }
 command -v swiftc >/dev/null || { echo "swiftc is required (xcode-select --install)"; exit 1; }
 
-mkdir -p "$target/sessions"
-cp "$here/hook.sh" "$target/hook.sh"
-chmod +x "$target/hook.sh"
+mkdir -p "$target/sessions" "$target/limits"
+cp "$here/hook.sh" "$here/statusline.sh" "$target/"
+chmod +x "$target/hook.sh" "$target/statusline.sh"
 
-if [ -f "$settings" ] && grep -q 'traffic-light/hook.sh' "$settings"; then
+[ -f "$settings" ] || echo '{}' > "$settings"
+backed_up=""
+backup_settings() {
+  [ -n "$backed_up" ] && return
+  cp "$settings" "$target/settings.json.backup-$(date +%Y%m%d-%H%M%S)"
+  backed_up=1
+}
+
+if grep -q 'traffic-light/hook.sh' "$settings"; then
   echo "hooks already present in $settings, left unchanged"
 else
-  [ -f "$settings" ] || echo '{}' > "$settings"
-  cp "$settings" "$target/settings.json.backup-$(date +%Y%m%d-%H%M%S)"
+  backup_settings
   jq --arg h 'bash "$HOME/.claude/traffic-light/hook.sh"' '
     def cmd($state): {type: "command", command: ($h + " " + $state), timeout: 5};
     def entry($state): {hooks: [cmd($state)]};
@@ -45,6 +54,18 @@ else
     })' "$settings" > "$settings.new"
   mv "$settings.new" "$settings"
   echo "hooks added to $settings"
+fi
+
+if jq -e '(.statusLine.command // "") | contains("traffic-light/statusline.sh")' "$settings" >/dev/null; then
+  echo "status line already wrapped in $settings, left unchanged"
+else
+  backup_settings
+  # An empty file means there was no status line, uninstall.sh then removes it.
+  jq -r '.statusLine.command // empty' "$settings" > "$target/statusline-command"
+  jq --arg c 'bash "$HOME/.claude/traffic-light/statusline.sh"' \
+    '.statusLine = ((.statusLine // {}) + {type: "command", command: $c})' "$settings" > "$settings.new"
+  mv "$settings.new" "$settings"
+  echo "status line wrapped in $settings, the previous command is kept in $target/statusline-command"
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents"

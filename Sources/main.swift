@@ -13,6 +13,11 @@
 // SessionStart hook receives) followed by the last message you sent to that session,
 // which the UserPromptSubmit hook receives, cut to one line.
 //
+// Under the lamps are the usage limits of the Claude subscription (the 5-hour window
+// and the weekly one): how much is used and when it resets. Claude Code hands them to
+// the status line command, statusline.sh writes them into ~/.claude/traffic-light/limits/.
+// Nothing goes over the network.
+//
 // The panel is borderless, stays above every window and on every Space, never takes the
 // focus away from the app you work in, and can be dragged anywhere. Its position is
 // remembered. A right click opens the menu with Quit.
@@ -129,7 +134,83 @@ final class SessionStore {
     }
 }
 
-/// One row per session: a lamp and the session's name.
+/// One usage limit of the Claude subscription: the 5-hour window, the weekly window,
+/// or a spend limit behind a gateway. statusline.sh stores each one in
+/// ~/.claude/traffic-light/limits/<name> as "<used percent> <reset unix time>".
+struct UsageLimit {
+    let name: String
+    let usedPercent: Double
+    let resetsAt: Date
+
+    static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/traffic-light/limits", isDirectory: true)
+    /// Known limits come first, in this order, any other one after them by name.
+    static let order = ["five_hour", "seven_day", "spend_limit"]
+
+    var shortLabel: String {
+        switch name {
+        case "five_hour": return "5h"
+        case "seven_day": return "7d"
+        case "spend_limit": return "$"
+        default: return String(name.prefix(3))
+        }
+    }
+
+    var longLabel: String {
+        switch name {
+        case "five_hour": return "5-hour limit"
+        case "seven_day": return "Weekly limit"
+        case "spend_limit": return "Spend limit"
+        default: return name.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+
+    /// A window is back at zero once its reset time has passed, even before a status
+    /// line update says so. A spend limit can go above 100.
+    func used(at now: Date) -> Double {
+        now >= resetsAt ? 0 : max(usedPercent, 0)
+    }
+
+    /// The time left until the reset, "42m", "2h 14m" or "3d 4h", empty once it passed.
+    func remaining(at now: Date) -> String {
+        let seconds = Int(resetsAt.timeIntervalSince(now))
+        guard seconds > 0 else { return "" }
+        let minutes = (seconds + 59) / 60
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h \(minutes % 60)m" }
+        return "\(hours / 24)d \(hours % 24)h"
+    }
+
+    func detail(at now: Date) -> String {
+        let percent = "\(Int(used(at: now).rounded()))%"
+        let left = remaining(at: now)
+        return left.isEmpty ? percent : "\(percent) · \(left)"
+    }
+
+    /// Green while there is plenty left, yellow from 70%, red from 90%.
+    static func color(forUsed used: Double) -> NSColor {
+        if used >= 90 { return SessionState.working.color }
+        if used >= 70 { return SessionState.attention.color }
+        return SessionState.idle.color
+    }
+
+    static func readAll() -> [UsageLimit] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
+        var limits: [UsageLimit] = []
+        for name in names where !name.contains(".tmp.") {
+            guard let text = try? String(contentsOf: directory.appendingPathComponent(name), encoding: .utf8) else { continue }
+            let parts = text.split(whereSeparator: \.isWhitespace)
+            guard parts.count >= 2, let used = Double(parts[0]), let resets = Double(parts[1]) else { continue }
+            limits.append(UsageLimit(name: name, usedPercent: used, resetsAt: Date(timeIntervalSince1970: resets)))
+        }
+        func rank(_ limit: UsageLimit) -> Int { order.firstIndex(of: limit.name) ?? order.count }
+        return limits.sorted { rank($0) != rank($1) ? rank($0) < rank($1) : $0.name < $1.name }
+    }
+}
+
+/// One row per session: a lamp and the session's name. Below them one row per usage
+/// limit: a bar, the percentage used and the time left until the reset.
 @MainActor
 final class LampListView: NSView {
     static let minWidth: CGFloat = 160
@@ -143,25 +224,39 @@ final class LampListView: NSView {
     static let emptyText = "no Claude session"
     /// The last message is cut to this many characters on the panel.
     static let promptLength = 60
+    static let limitRowHeight: CGFloat = 18
+    /// The space between the last lamp and the first limit, with a hairline in it.
+    static let limitsGap: CGFloat = 6
+    static let minBarWidth: CGFloat = 60
+    static let limitFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+    /// Fixed, so the bars do not jump while the countdown ticks.
+    static let limitDetailWidth = ceil(textWidth("100% · 23h 59m", font: limitFont)) + 4
 
     var sessions: [Session] = [] {
+        didSet { needsDisplay = true }
+    }
+    var limits: [UsageLimit] = [] {
         didSet { needsDisplay = true }
     }
     var menuProvider: (() -> NSMenu)?
 
     override var mouseDownCanMoveWindow: Bool { true }
 
-    static func height(forRows rows: Int) -> CGFloat {
-        CGFloat(max(rows, 1)) * rowHeight + 2 * padding
+    static func height(forRows rows: Int, limits: Int) -> CGFloat {
+        let limitsHeight = limits > 0 ? limitsGap + CGFloat(limits) * limitRowHeight : 0
+        return CGFloat(max(rows, 1)) * rowHeight + 2 * padding + limitsHeight
     }
 
     /// Wide enough that every row's label and state fit without truncation.
-    static func width(for sessions: [Session]) -> CGFloat {
+    static func width(for sessions: [Session], limits: [UsageLimit]) -> CGFloat {
         var widest: CGFloat = textWidth(emptyText, font: labelFont)
         for (session, label) in zip(sessions, labels(for: sessions)) {
             let row = textWidth(label.prefix, font: prefixFont) + textWidth(label.text, font: labelFont)
                 + 10 + textWidth(session.state.label, font: detailFont)
             widest = max(widest, row)
+        }
+        if !limits.isEmpty {
+            widest = max(widest, minBarWidth + 8 + limitDetailWidth)
         }
         return min(max(ceil(widest) + 2 * padding + lampColumn + 8, minWidth), maxWidth)
     }
@@ -187,7 +282,7 @@ final class LampListView: NSView {
             drawLamp(at: NSPoint(x: Self.padding + 13, y: y + Self.rowHeight / 2), color: NSColor(white: 0.4, alpha: 1))
             Self.draw(Self.emptyText, font: font, color: NSColor(white: 0.55, alpha: 1),
                       in: NSRect(x: Self.padding + Self.lampColumn, y: y, width: bounds.width - Self.lampColumn - 2 * Self.padding, height: Self.rowHeight))
-            return
+            y -= Self.rowHeight
         }
 
         for (session, label) in zip(sessions, labels) {
@@ -205,6 +300,38 @@ final class LampListView: NSView {
                       in: NSRect(x: row.maxX - detailWidth, y: row.minY, width: detailWidth, height: row.height))
             y -= Self.rowHeight
         }
+
+        guard !limits.isEmpty else { return }
+        let lampsBottom = y + Self.rowHeight
+        NSColor(white: 1, alpha: 0.12).setFill()
+        NSRect(x: Self.padding + 4, y: lampsBottom - Self.limitsGap / 2, width: bounds.width - 2 * Self.padding - 8, height: 1).fill()
+        let now = Date()
+        var limitY = lampsBottom - Self.limitsGap - Self.limitRowHeight
+        for limit in limits {
+            drawLimit(limit, in: NSRect(x: Self.padding, y: limitY, width: bounds.width - 2 * Self.padding, height: Self.limitRowHeight), now: now)
+            limitY -= Self.limitRowHeight
+        }
+    }
+
+    /// The short name under the lamp column, the bar, then the percentage and the time left.
+    private func drawLimit(_ limit: UsageLimit, in row: NSRect, now: Date) {
+        let used = limit.used(at: now)
+        let color = UsageLimit.color(forUsed: used)
+        Self.draw(limit.shortLabel, font: Self.limitFont, color: NSColor(white: 0.6, alpha: 1), alignment: .center,
+                  in: NSRect(x: row.minX, y: row.minY, width: 26, height: row.height))
+        let detailX = row.maxX - Self.limitDetailWidth
+        let barX = row.minX + Self.lampColumn
+        let bar = NSRect(x: barX, y: row.midY - 2.5, width: detailX - 8 - barX, height: 5)
+        NSColor(white: 1, alpha: 0.15).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 2.5, yRadius: 2.5).fill()
+        if used > 0 {
+            var fill = bar
+            fill.size.width = max(bar.height, bar.width * min(used, 100) / 100)
+            color.setFill()
+            NSBezierPath(roundedRect: fill, xRadius: 2.5, yRadius: 2.5).fill()
+        }
+        Self.draw(limit.detail(at: now), font: Self.limitFont, color: color, alignment: .right,
+                  in: NSRect(x: detailX, y: row.minY, width: Self.limitDetailWidth, height: row.height))
     }
 
     private func drawLamp(at center: NSPoint, color: NSColor) {
@@ -277,7 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func makePanel() {
-        let size = NSSize(width: LampListView.width(for: []), height: LampListView.height(forRows: 1))
+        let size = NSSize(width: LampListView.width(for: [], limits: []), height: LampListView.height(forRows: 1, limits: 0))
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -357,12 +484,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // liveSessions recreated a missing folder, the watcher must follow it.
             watchDirectory()
         }
+        // The status line writes the limits, the 3 second timer is quick enough for them
+        // and keeps the countdown going.
+        let limits = UsageLimit.readAll()
         listView.sessions = sessions
-        listView.toolTip = sessions.isEmpty ? nil : sessions.map { session in
-            let name = session.title.isEmpty ? session.folder : session.title
-            return session.prompt.isEmpty ? name : "\(name): \(session.prompt)"
-        }.joined(separator: "\n\n")
-        let size = NSSize(width: LampListView.width(for: sessions), height: LampListView.height(forRows: sessions.count))
+        listView.limits = limits
+        listView.toolTip = tooltip(sessions: sessions, limits: limits)
+        let size = NSSize(width: LampListView.width(for: sessions, limits: limits),
+                          height: LampListView.height(forRows: sessions.count, limits: limits.count))
         if panel.frame.size != size {
             // The top left corner stays put, unless the wider panel would leave the screen.
             var frame = NSRect(x: panel.frame.minX, y: panel.frame.maxY - size.height, width: size.width, height: size.height)
@@ -374,6 +503,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             panel.setFrame(frame, display: true)
         }
+    }
+
+    private static let resetFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE HH:mm"
+        return formatter
+    }()
+
+    /// Each session with its full last message, then each limit with its reset time.
+    private func tooltip(sessions: [Session], limits: [UsageLimit]) -> String? {
+        var parts = sessions.map { session in
+            let name = session.title.isEmpty ? session.folder : session.title
+            return session.prompt.isEmpty ? name : "\(name): \(session.prompt)"
+        }
+        let now = Date()
+        let limitLines = limits.map { limit in
+            let at = Self.resetFormatter.string(from: limit.resetsAt)
+            return limit.remaining(at: now).isEmpty
+                ? "\(limit.longLabel): reset \(at)"
+                : "\(limit.longLabel): \(Int(limit.used(at: now).rounded()))% used, resets \(at)"
+        }
+        if !limitLines.isEmpty { parts.append(limitLines.joined(separator: "\n")) }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
     }
 
     private func makeMenu() -> NSMenu {
